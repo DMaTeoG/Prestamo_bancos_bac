@@ -1,8 +1,9 @@
+import logging
 from rest_framework import generics, status
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
-from django.shortcuts import get_object_or_404
 
 from apps.companies.models import CompanyProfile, CompanyMembership
 from apps.companies.validators import validate_and_clean_nit
@@ -12,8 +13,15 @@ from apps.scoring.serializers import (
     EvaluationDetailSerializer,
     ModelVersionSerializer,
 )
-from apps.scoring.services import evaluate_company
-from apps.accounts.permissions import IsAnalyst, IsAdminUserRole
+from apps.scoring.services import evaluate_company, get_active_model_version
+from apps.accounts.permissions import (
+    IsAdminUserRole,
+    IsCompanyAuthorizedObjectPermission,
+)
+from apps.audit.models import AuditAction
+from apps.audit.services import log_action
+
+logger = logging.getLogger("apps.scoring.views")
 
 
 class EvaluationListCreateView(APIView):
@@ -21,23 +29,33 @@ class EvaluationListCreateView(APIView):
 
     def get(self, request):
         user = request.user
-        queryset = Evaluation.objects.all()
+        queryset = Evaluation.objects.select_related("company", "requested_by", "model_version").all()
 
         # Role restrictions
         if user.role == "COMPANY" and not user.is_superuser:
-            memberships = CompanyMembership.objects.filter(user=user, status="APPROVED").values_list("company_id", flat=True)
+            memberships = CompanyMembership.objects.filter(
+                user=user, status="APPROVED"
+            ).values_list("company_id", flat=True)
             queryset = queryset.filter(company_id__in=memberships)
         elif user.role == "ANALYST" and not user.is_superuser:
             queryset = queryset.filter(requested_by=user)
 
-        # Filters
+        # Filters (nit, risk_level, date_from, date_to)
         nit = request.query_params.get("nit")
         if nit:
-            queryset = queryset.filter(company__nit__icontains=nit)
+            queryset = queryset.filter(company__nit__icontains=nit.strip())
 
         risk = request.query_params.get("risk_level")
         if risk:
-            queryset = queryset.filter(risk_level=risk)
+            queryset = queryset.filter(risk_level=risk.strip().upper())
+
+        date_from = request.query_params.get("date_from")
+        if date_from:
+            queryset = queryset.filter(created_at__date__gte=date_from)
+
+        date_to = request.query_params.get("date_to")
+        if date_to:
+            queryset = queryset.filter(created_at__date__lte=date_to)
 
         serializer = EvaluationDetailSerializer(queryset[:50], many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
@@ -45,8 +63,15 @@ class EvaluationListCreateView(APIView):
     def post(self, request):
         # Only ANALYST and ADMIN can request credit evaluations
         if request.user.role == "COMPANY" and not request.user.is_superuser:
+            logger.warning(
+                "Forbidden evaluation request by COMPANY user_id=%s",
+                request.user.id,
+            )
             return Response(
-                {"code": "FORBIDDEN", "message": "El usuario con rol Empresa no puede solicitar evaluaciones de crédito."},
+                {
+                    "code": "FORBIDDEN",
+                    "message": "El usuario con rol Empresa no puede solicitar evaluaciones de crédito.",
+                },
                 status=status.HTTP_403_FORBIDDEN,
             )
 
@@ -58,15 +83,21 @@ class EvaluationListCreateView(APIView):
 
         try:
             nit_clean, _ = validate_and_clean_nit(nit_raw)
-        except Exception as e:
+        except Exception as exc:
+            logger.warning(
+                "Invalid NIT on evaluation request by user_id=%s: %s",
+                request.user.id,
+                str(exc),
+            )
             return Response(
-                {"code": "INVALID_NIT", "message": str(e)},
+                {"code": "INVALID_NIT", "message": str(exc)},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         company = CompanyProfile.objects.filter(nit=nit_clean).first()
         if not company:
             from apps.sources.services import OpenDataSource
+
             source = OpenDataSource()
             info = source.fetch_company_info(nit_clean)
             company = CompanyProfile.objects.create(
@@ -90,6 +121,61 @@ class EvaluationListCreateView(APIView):
 
 
 class EvaluationDetailView(generics.RetrieveAPIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsCompanyAuthorizedObjectPermission]
     serializer_class = EvaluationDetailSerializer
-    queryset = Evaluation.objects.all()
+    queryset = Evaluation.objects.select_related("company", "requested_by", "model_version").all()
+
+    def get_object(self):
+        obj = super().get_object()
+        user = self.request.user
+        if user.role == "ANALYST" and not user.is_superuser and obj.requested_by_id != user.id:
+            logger.warning(
+                "Object permission denied: ANALYST user_id=%s attempted to access evaluation_id=%s owned by user_id=%s",
+                user.id,
+                obj.id,
+                obj.requested_by_id,
+            )
+            raise PermissionDenied(detail="El Analista solo puede consultar las evaluaciones que ha solicitado.")
+        return obj
+
+
+class AdminModelVersionListView(generics.ListAPIView):
+    """GET /api/v1/admin/models/ — Lista todas las versiones de modelo ML (solo Admin)."""
+
+    permission_classes = [IsAdminUserRole]
+    serializer_class = ModelVersionSerializer
+    pagination_class = None
+
+    def get_queryset(self):
+        if not ModelVersion.objects.exists():
+            get_active_model_version()
+        return ModelVersion.objects.all().order_by("-trained_at")
+
+
+class AdminModelActivateView(APIView):
+    """POST /api/v1/admin/models/<pk>/activate/ — Activa una versión de modelo ML (solo Admin)."""
+
+    permission_classes = [IsAdminUserRole]
+
+    def post(self, request, pk):
+        model_version = generics.get_object_or_404(ModelVersion, pk=pk)
+        model_version.is_active = True
+        model_version.save()
+
+        log_action(
+            user=request.user,
+            action=AuditAction.MODEL_ACTIVATION,
+            entity="ModelVersion",
+            entity_id=model_version.id,
+            request=request,
+            metadata={"version": model_version.version, "algorithm": model_version.algorithm},
+        )
+        logger.info(
+            "Model version activated by admin_id=%s: version=%s (id=%s)",
+            request.user.id,
+            model_version.version,
+            model_version.id,
+        )
+
+        serializer = ModelVersionSerializer(model_version)
+        return Response(serializer.data, status=status.HTTP_200_OK)

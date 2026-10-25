@@ -1,8 +1,9 @@
+import io
 import pytest
 from django.urls import reverse
 from rest_framework.test import APIClient
 from apps.accounts.models import CustomUser, Role
-from apps.companies.models import CompanyProfile
+from apps.companies.models import CompanyProfile, CompanyMembership
 
 
 @pytest.mark.django_db
@@ -19,6 +20,11 @@ class TestScoringAPI:
             nit="800197268-4",
             legal_name="BANCOLOMBIA S.A.",
             ciiu="6412",
+        )
+        self.other_company = CompanyProfile.objects.create(
+            nit="900123456-8",
+            legal_name="OTRA EMPRESA S.A.S.",
+            ciiu="4690",
         )
 
     def test_evaluations_post_as_analyst(self):
@@ -56,3 +62,62 @@ class TestScoringAPI:
         assert res.status_code == 200
         assert res.data["nit"] == "800197268-4"
         assert res.data["legal_name"] == "BANCOLOMBIA S.A."
+
+    def test_company_object_level_permissions_and_financial_upload(self):
+        # Without approved membership, company_user is forbidden from accessing company detail & financials
+        self.client.force_authenticate(user=self.company_user)
+        detail_url = reverse("company-detail", kwargs={"pk": self.company.id})
+        fin_url = reverse("financial-statement-list-create", kwargs={"company_id": self.company.id})
+        csv_url = reverse("financial-statement-csv-import", kwargs={"company_id": self.company.id})
+
+        assert self.client.get(detail_url).status_code == 403
+        assert self.client.get(fin_url).status_code == 403
+
+        # Approve membership for self.company
+        CompanyMembership.objects.create(
+            user=self.company_user,
+            company=self.company,
+            status="APPROVED",
+        )
+
+        # Now company_user can access its own company and upload statements
+        assert self.client.get(detail_url).status_code == 200
+        my_comp_res = self.client.get(reverse("company-my-company"))
+        assert my_comp_res.status_code == 200
+        assert my_comp_res.data["nit"] == "800197268-4"
+
+        post_fin = self.client.post(
+            fin_url,
+            {
+                "fiscal_year": 2023,
+                "revenue": "1500000000.00",
+                "expenses": "1100000000.00",
+                "operating_income": "400000000.00",
+                "net_income": "280000000.00",
+                "total_assets": "2000000000.00",
+                "current_assets": "800000000.00",
+                "total_liabilities": "700000000.00",
+                "current_liabilities": "350000000.00",
+                "financial_debt": "250000000.00",
+                "financial_expenses": "45000000.00",
+            },
+            format="json",
+        )
+        assert post_fin.status_code == 201
+        assert post_fin.data["ratios"]["confidence_level"] == "ALTA"
+
+        # CSV import on own company succeeds
+        csv_content = (
+            "fiscal_year,revenue,expenses,operating_income,net_income,"
+            "total_assets,current_assets,total_liabilities,current_liabilities,"
+            "financial_debt,financial_expenses\n"
+            "2022,1200000000,900000000,300000000,200000000,1800000000,700000000,650000000,300000000,200000000,40000000\n"
+        )
+        csv_file = io.BytesIO(csv_content.encode("utf-8"))
+        csv_file.name = "estados.csv"
+        csv_res = self.client.post(csv_url, {"file": csv_file}, format="multipart")
+        assert csv_res.status_code == 201
+
+        # Still forbidden from accessing other_company
+        other_detail_url = reverse("company-detail", kwargs={"pk": self.other_company.id})
+        assert self.client.get(other_detail_url).status_code == 403

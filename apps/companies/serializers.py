@@ -38,4 +38,4 @@ class CompanyMembershipSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "user", "approved_by", "created_at", "updated_at"]
+        read_only_fields = ["id", "approved_by", "created_at", "updated_at"]

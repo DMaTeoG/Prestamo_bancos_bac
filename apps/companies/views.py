@@ -1,8 +1,8 @@
+import logging
 from rest_framework import generics, status
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
-from django.shortcuts import get_object_or_404
 
 from apps.companies.models import CompanyProfile, CompanyMembership
 from apps.companies.serializers import CompanyProfileSerializer, CompanyMembershipSerializer
@@ -10,7 +10,13 @@ from apps.companies.validators import validate_and_clean_nit
 from apps.sources.services import OpenDataSource
 from apps.audit.services import log_action
 from apps.audit.models import AuditAction
-from apps.accounts.permissions import IsAnalyst, IsCompanyUser
+from apps.accounts.permissions import (
+    IsAdminUserRole,
+    IsCompanyAuthorizedObjectPermission,
+    user_can_access_company,
+)
+
+logger = logging.getLogger("apps.companies.views")
 
 
 class CompanyLookupView(APIView):
@@ -26,9 +32,14 @@ class CompanyLookupView(APIView):
 
         try:
             nit_clean, dv = validate_and_clean_nit(nit_param)
-        except Exception as e:
+        except Exception as exc:
+            logger.warning(
+                "NIT validation failed on lookup by user_id=%s: %s",
+                request.user.id,
+                str(exc),
+            )
             return Response(
-                {"code": "INVALID_NIT", "message": str(e)},
+                {"code": "INVALID_NIT", "message": str(exc)},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -38,6 +49,11 @@ class CompanyLookupView(APIView):
                 user=request.user, company__nit=nit_clean, status="APPROVED"
             ).first()
             if not membership:
+                logger.warning(
+                    "Forbidden NIT lookup by COMPANY user_id=%s for nit=%s",
+                    request.user.id,
+                    nit_clean,
+                )
                 return Response(
                     {"code": "FORBIDDEN", "message": "El usuario Empresa solo puede consultar su propio NIT autorizado."},
                     status=status.HTTP_403_FORBIDDEN,
@@ -45,7 +61,6 @@ class CompanyLookupView(APIView):
 
         company = CompanyProfile.objects.filter(nit=nit_clean).first()
         if not company:
-            # Consult external sources (Open Data or Mock fallback)
             source = OpenDataSource()
             info = source.fetch_company_info(nit_clean)
             if info:
@@ -61,6 +76,7 @@ class CompanyLookupView(APIView):
                 )
 
         if not company:
+            logger.warning("Company not found for nit=%s", nit_clean)
             return Response(
                 {"code": "NOT_FOUND", "message": f"No se encontró información para el NIT {nit_clean}."},
                 status=status.HTTP_404_NOT_FOUND,
@@ -74,12 +90,107 @@ class CompanyLookupView(APIView):
             request=request,
             metadata={"nit": nit_clean},
         )
+        logger.info("NIT lookup succeeded: user_id=%s nit=%s company_id=%s", request.user.id, nit_clean, company.id)
 
         serializer = CompanyProfileSerializer(company)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
 
 class CompanyDetailView(generics.RetrieveAPIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsCompanyAuthorizedObjectPermission]
     serializer_class = CompanyProfileSerializer
     queryset = CompanyProfile.objects.all()
+
+
+class MyCompanyView(APIView):
+    """
+    GET /api/v1/companies/my-company/
+    Returns the approved CompanyProfile linked to the current COMPANY user
+    (or the first company for Analyst/Admin preview).
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        if request.user.role == "COMPANY" and not request.user.is_superuser:
+            membership = (
+                CompanyMembership.objects.filter(user=request.user, status="APPROVED")
+                .select_related("company")
+                .first()
+            )
+            if not membership:
+                return Response(
+                    {
+                        "code": "NO_APPROVED_MEMBERSHIP",
+                        "message": "No tienes ningún vínculo NIT aprobado por un Administrador todavía.",
+                    },
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+            company = membership.company
+        else:
+            company = CompanyProfile.objects.first()
+            if not company:
+                return Response(
+                    {"code": "NOT_FOUND", "message": "No hay empresas registradas en el sistema."},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+        if not user_can_access_company(request.user, company):
+            return Response(
+                {"code": "FORBIDDEN", "message": "No autorizado para ver esta empresa."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        serializer = CompanyProfileSerializer(company)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class AdminMembershipListView(generics.ListCreateAPIView):
+    """GET/POST /api/v1/admin/memberships/ — Lista o crea vínculos Usuario-NIT (solo Admin)."""
+
+    permission_classes = [IsAdminUserRole]
+    serializer_class = CompanyMembershipSerializer
+    queryset = CompanyMembership.objects.select_related("user", "company", "approved_by").order_by("-created_at")
+    pagination_class = None
+
+
+class AdminMembershipUpdateView(APIView):
+    """PATCH /api/v1/admin/memberships/<pk>/ — Aprueba o rechaza vínculo Usuario-NIT (solo Admin)."""
+
+    permission_classes = [IsAdminUserRole]
+
+    def patch(self, request, pk):
+        membership = generics.get_object_or_404(CompanyMembership, pk=pk)
+        new_status = request.data.get("status", "APPROVED")
+        if new_status not in ("APPROVED", "REJECTED", "PENDING"):
+            return Response(
+                {"code": "INVALID_STATUS", "message": "El estado debe ser APPROVED, REJECTED o PENDING."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        membership.status = new_status
+        membership.approved_by = request.user
+        membership.save()
+
+        log_action(
+            user=request.user,
+            action=AuditAction.MEMBERSHIP_APPROVAL,
+            entity="CompanyMembership",
+            entity_id=membership.id,
+            request=request,
+            metadata={
+                "target_user": membership.user.email,
+                "nit": membership.company.nit,
+                "status": new_status,
+            },
+        )
+        logger.info(
+            "Membership updated by admin_id=%s: membership_id=%s status=%s nit=%s",
+            request.user.id,
+            membership.id,
+            new_status,
+            membership.company.nit,
+        )
+
+        serializer = CompanyMembershipSerializer(membership)
+        return Response(serializer.data, status=status.HTTP_200_OK)

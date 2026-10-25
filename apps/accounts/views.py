@@ -1,3 +1,4 @@
+import logging
 from rest_framework import status, generics
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -5,11 +6,17 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 from rest_framework_simplejwt.tokens import RefreshToken
 
+from apps.accounts.models import CustomUser
+from apps.accounts.permissions import IsAdminUserRole
 from apps.accounts.serializers import (
     CustomTokenObtainPairSerializer,
     UserSerializer,
     RegisterSerializer,
 )
+from apps.audit.models import AuditAction
+from apps.audit.services import log_action
+
+logger = logging.getLogger("apps.accounts.views")
 
 
 class LoginView(TokenObtainPairView):
@@ -21,6 +28,20 @@ class LoginView(TokenObtainPairView):
         if response.status_code == status.HTTP_200_OK:
             access_token = response.data.get("access")
             refresh_token = response.data.get("refresh")
+            user_data = response.data.get("user", {})
+            user_id = user_data.get("id")
+
+            user_obj = CustomUser.objects.filter(pk=user_id).first() if user_id else None
+            if user_obj:
+                log_action(
+                    user=user_obj,
+                    action=AuditAction.USER_LOGIN,
+                    entity="CustomUser",
+                    entity_id=user_obj.id,
+                    request=request,
+                    metadata={"role": user_obj.role},
+                )
+                logger.info("User login successful: user_id=%s role=%s", user_obj.id, user_obj.role)
 
             # Set httpOnly cookies
             response.set_cookie(
@@ -48,17 +69,19 @@ class CustomRefreshTokenView(TokenRefreshView):
     def post(self, request, *args, **kwargs):
         refresh_token = request.COOKIES.get("refresh_token") or request.data.get("refresh")
         if not refresh_token:
+            logger.warning("Token refresh failed: missing refresh_token")
             return Response(
-                {"error": "No se proporcionó token de refresco."},
+                {"code": "MISSING_REFRESH_TOKEN", "message": "No se proporcionó token de refresco."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         serializer = self.get_serializer(data={"refresh": refresh_token})
         try:
             serializer.is_valid(raise_exception=True)
-        except Exception as e:
+        except Exception as exc:
+            logger.warning("Token refresh failed: %s", exc.__class__.__name__)
             return Response(
-                {"error": "Token de refresco inválido o expirado."},
+                {"code": "INVALID_REFRESH_TOKEN", "message": "Token de refresco inválido o expirado."},
                 status=status.HTTP_401_UNAUTHORIZED,
             )
 
@@ -84,9 +107,10 @@ class LogoutView(APIView):
             if refresh_token:
                 token = RefreshToken(refresh_token)
                 token.blacklist()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Logout token blacklist skipped: %s", exc.__class__.__name__)
 
+        logger.info("User logged out: user_id=%s", request.user.id)
         response = Response(
             {"message": "Sesión cerrada correctamente."},
             status=status.HTTP_200_OK,
@@ -107,3 +131,30 @@ class UserProfileView(generics.RetrieveUpdateAPIView):
 class RegisterView(generics.CreateAPIView):
     permission_classes = [AllowAny]
     serializer_class = RegisterSerializer
+
+
+class AdminUserListView(generics.ListAPIView):
+    """GET /api/v1/admin/users/ — Lista todos los usuarios (solo Administrador)."""
+
+    permission_classes = [IsAdminUserRole]
+    serializer_class = UserSerializer
+    queryset = CustomUser.objects.all().order_by("-created_at")
+    pagination_class = None
+
+
+class AdminUserDetailView(generics.RetrieveUpdateAPIView):
+    """PATCH /api/v1/admin/users/<pk>/ — Actualiza rol o estado activo de un usuario."""
+
+    permission_classes = [IsAdminUserRole]
+    serializer_class = UserSerializer
+    queryset = CustomUser.objects.all()
+
+    def perform_update(self, serializer):
+        updated_user = serializer.save()
+        logger.info(
+            "Admin user_id=%s updated user_id=%s (role=%s, is_active=%s)",
+            self.request.user.id,
+            updated_user.id,
+            updated_user.role,
+            updated_user.is_active,
+        )
