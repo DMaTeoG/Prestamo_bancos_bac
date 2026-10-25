@@ -1,10 +1,17 @@
 import pytest
-from apps.sources.services import MockSource, OpenDataSource
+from apps.sources.services import MockSource, OpenDataSource, build_retry_session
 from apps.sources.models import DataSourceSnapshot
 
 
 @pytest.mark.django_db
 class TestDataSources:
+    def test_retry_session_configuration(self):
+        session = build_retry_session(retries=2, backoff_factor=0.3)
+        adapter = session.get_adapter("https://www.datos.gov.co/")
+        assert adapter.max_retries.total == 2
+        assert 503 in adapter.max_retries.status_forcelist
+        session.close()
+
     def test_mock_source_returns_valid_dict_and_snapshot(self):
         source = MockSource()
         data = source.fetch_company_info("900123456-7")

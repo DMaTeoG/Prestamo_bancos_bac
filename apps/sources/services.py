@@ -1,8 +1,30 @@
-import os
+import logging
 import requests
 from abc import ABC, abstractmethod
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from django.conf import settings
 from apps.sources.models import DataSourceSnapshot
+
+logger = logging.getLogger("apps.sources.services")
+
+
+def build_retry_session(retries: int = 2, backoff_factor: float = 0.3) -> requests.Session:
+    """Builds a requests Session with bounded retries for external open data queries (T2.3)."""
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=retries,
+        read=retries,
+        connect=retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
 
 class CompanySource(ABC):
@@ -19,9 +41,8 @@ class MockSource(CompanySource):
 
     def fetch_company_info(self, nit_clean: str) -> dict | None:
         raw_nit = nit_clean.split("-")[0]
-        # Deterministic generation based on NIT digits
         seed_num = int(raw_nit) if raw_nit.isdigit() else 900123456
-        
+
         cities = ["Bogotá, D.C.", "Medellín", "Cali", "Barranquilla", "Bucaramanga"]
         ciius = ["4690", "6201", "4110", "1010", "7020"]
         sizes = ["MICRO", "PEQUENA", "MEDIANA", "GRANDE"]
@@ -44,13 +65,16 @@ class MockSource(CompanySource):
             status_code=200,
             payload=data,
         )
+        logger.info("MockSource snapshot recorded for nit=%s", nit_clean)
         return data
 
 
 class OpenDataSource(CompanySource):
     """
-    Adaptador oficial para datos.gov.co utilizando la SODA API (Socrata).
+    Adaptador oficial para datos.gov.co utilizando la SODA API (Socrata)
+    con timeout y reintentos limitados (T2.2, T2.3).
     """
+
     CARATULA_URL = "https://www.datos.gov.co/resource/2387-m22z.json"
 
     def fetch_company_info(self, nit_clean: str) -> dict | None:
@@ -61,10 +85,12 @@ class OpenDataSource(CompanySource):
             headers["X-App-Token"] = app_token
 
         params = {"nit": raw_nit, "$limit": 1}
-        timeout = getattr(settings, "OPEN_DATA_TIMEOUT_SECONDS", 5)
+        timeout = getattr(settings, "OPEN_DATA_TIMEOUT_SECONDS", 4)
+        max_retries = getattr(settings, "OPEN_DATA_MAX_RETRIES", 2)
 
+        session = build_retry_session(retries=max_retries)
         try:
-            response = requests.get(
+            response = session.get(
                 self.CARATULA_URL,
                 params=params,
                 headers=headers,
@@ -81,24 +107,41 @@ class OpenDataSource(CompanySource):
                 )
                 if json_data and isinstance(json_data, list) and len(json_data) > 0:
                     row = json_data[0]
+                    logger.info("OpenDataSource match found on datos.gov.co for nit=%s", nit_clean)
                     return {
                         "nit": nit_clean,
                         "dv": row.get("dv", nit_clean.split("-")[1] if "-" in nit_clean else "0"),
-                        "legal_name": row.get("razon_social") or row.get("nombre_completo", f"EMPRESA NIT {raw_nit}"),
+                        "legal_name": row.get("razon_social")
+                        or row.get("nombre_completo", f"EMPRESA NIT {raw_nit}"),
                         "ciiu": row.get("ciiu", "4690"),
-                        "registration_date": row.get("fecha_corte", "2020-01-01")[:10],
+                        "registration_date": str(row.get("fecha_corte", "2020-01-01"))[:10],
                         "status": "ACTIVA",
                         "city": row.get("ciudad", "Bogotá, D.C."),
                         "size": "MEDIANA",
                         "origin": "PUBLIC",
                     }
-        except Exception as e:
+            else:
+                DataSourceSnapshot.objects.create(
+                    nit=nit_clean,
+                    source_name="datos.gov.co",
+                    status_code=status_code,
+                    payload={"error": f"HTTP {status_code}"},
+                )
+                logger.warning("OpenDataSource returned status=%s for nit=%s", status_code, nit_clean)
+        except Exception as exc:
+            logger.warning(
+                "OpenDataSource request failed for nit=%s (%s): falling back to MockSource",
+                nit_clean,
+                exc.__class__.__name__,
+            )
             DataSourceSnapshot.objects.create(
                 nit=nit_clean,
                 source_name="datos.gov.co",
                 status_code=500,
-                payload={"error": str(e)},
+                payload={"error": str(exc)},
             )
+        finally:
+            session.close()
 
         # Automatic transparent fallback to MockSource if Open Data has no record or fails
         mock = MockSource()
