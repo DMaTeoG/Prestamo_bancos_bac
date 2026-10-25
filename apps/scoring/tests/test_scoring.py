@@ -51,3 +51,12 @@ class TestScoringPipeline:
         assert eval_1.score == eval_2.score
         assert eval_1.pd == eval_2.pd
         assert Evaluation.objects.count() == 2
+
+    def test_seed_demo_command(self):
+        from django.core.management import call_command
+
+        call_command("seed_demo")
+        assert CustomUser.objects.filter(email="admin.demo@banco.com").exists()
+        assert CustomUser.objects.filter(email="analista.demo@banco.com").exists()
+        assert CustomUser.objects.filter(email="empresa.demo@empresa.com").exists()
+        assert Evaluation.objects.filter(company__nit="800197268-4").exists()
