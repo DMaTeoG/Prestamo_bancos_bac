@@ -69,13 +69,24 @@ class MockSource(CompanySource):
         return data
 
 
+def _format_registration_date(raw_date: str | None) -> str:
+    """Formats YYYYMMDD date string to YYYY-MM-DD, or defaults cleanly."""
+    if not raw_date:
+        return "2020-01-01"
+    raw_str = str(raw_date).strip()
+    if len(raw_str) == 8 and raw_str.isdigit():
+        return f"{raw_str[:4]}-{raw_str[4:6]}-{raw_str[6:8]}"
+    return raw_str[:10]
+
+
 class OpenDataSource(CompanySource):
     """
     Adaptador oficial para datos.gov.co utilizando la SODA API (Socrata)
-    con timeout y reintentos limitados (T2.2, T2.3).
+    con el dataset oficial de RUES / Camaras de Comercio (c82u-588k).
+    Incluye timeout y reintentos limitados (T2.2, T2.3).
     """
 
-    CARATULA_URL = "https://www.datos.gov.co/resource/2387-m22z.json"
+    CARATULA_URL = "https://www.datos.gov.co/resource/c82u-588k.json"
 
     def fetch_company_info(self, nit_clean: str) -> dict | None:
         raw_nit = nit_clean.split("-")[0]
@@ -84,7 +95,10 @@ class OpenDataSource(CompanySource):
         if app_token:
             headers["X-App-Token"] = app_token
 
-        params = {"nit": raw_nit, "$limit": 1}
+        params = {
+            "$where": f"nit='{raw_nit}' or numero_identificacion='{raw_nit}'",
+            "$limit": 1,
+        }
         timeout = getattr(settings, "OPEN_DATA_TIMEOUT_SECONDS", 4)
         max_retries = getattr(settings, "OPEN_DATA_MAX_RETRIES", 2)
 
@@ -108,15 +122,23 @@ class OpenDataSource(CompanySource):
                 if json_data and isinstance(json_data, list) and len(json_data) > 0:
                     row = json_data[0]
                     logger.info("OpenDataSource match found on datos.gov.co for nit=%s", nit_clean)
+                    dv = (
+                        row.get("digito_verificacion")
+                        or row.get("dv")
+                        or (nit_clean.split("-")[1] if "-" in nit_clean else "0")
+                    )
+                    city = row.get("camara_comercio") or row.get("ciudad") or "Bogotá, D.C."
                     return {
-                        "nit": nit_clean,
-                        "dv": row.get("dv", nit_clean.split("-")[1] if "-" in nit_clean else "0"),
+                        "nit": f"{raw_nit}-{dv}" if "-" not in nit_clean else nit_clean,
+                        "dv": str(dv),
                         "legal_name": row.get("razon_social")
                         or row.get("nombre_completo", f"EMPRESA NIT {raw_nit}"),
-                        "ciiu": row.get("ciiu", "4690"),
-                        "registration_date": str(row.get("fecha_corte", "2020-01-01"))[:10],
-                        "status": "ACTIVA",
-                        "city": row.get("ciudad", "Bogotá, D.C."),
+                        "ciiu": row.get("cod_ciiu_act_econ_pri") or row.get("ciiu", "4690"),
+                        "registration_date": _format_registration_date(
+                            row.get("fecha_matricula") or row.get("fecha_corte")
+                        ),
+                        "status": row.get("estado_matricula") or row.get("status", "ACTIVA"),
+                        "city": city.title() if city.isupper() else city,
                         "size": "MEDIANA",
                         "origin": "PUBLIC",
                     }
