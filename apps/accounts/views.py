@@ -1,4 +1,5 @@
 import logging
+from django.conf import settings
 from rest_framework import status, generics
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -43,21 +44,23 @@ class LoginView(TokenObtainPairView):
                 )
                 logger.info("User login successful: user_id=%s role=%s", user_obj.id, user_obj.role)
 
-            # Set httpOnly cookies
+            # Set httpOnly cookies (SameSite=None + Secure=True in production for cross-domain Vercel <-> Render)
+            cookie_samesite = "Lax" if settings.DEBUG else "None"
+            cookie_secure = not settings.DEBUG
             response.set_cookie(
                 key="access_token",
                 value=access_token,
                 httponly=True,
-                samesite="Lax",
-                secure=False,
+                samesite=cookie_samesite,
+                secure=cookie_secure,
                 max_age=3600,
             )
             response.set_cookie(
                 key="refresh_token",
                 value=refresh_token,
                 httponly=True,
-                samesite="Lax",
-                secure=False,
+                samesite=cookie_samesite,
+                secure=cookie_secure,
                 max_age=7 * 24 * 3600,
             )
         return response
@@ -87,12 +90,14 @@ class CustomRefreshTokenView(TokenRefreshView):
 
         data = serializer.validated_data
         response = Response(data, status=status.HTTP_200_OK)
+        cookie_samesite = "Lax" if settings.DEBUG else "None"
+        cookie_secure = not settings.DEBUG
         response.set_cookie(
             key="access_token",
             value=data.get("access"),
             httponly=True,
-            samesite="Lax",
-            secure=False,
+            samesite=cookie_samesite,
+            secure=cookie_secure,
             max_age=3600,
         )
         return response

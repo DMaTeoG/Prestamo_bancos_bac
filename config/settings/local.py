@@ -1,7 +1,8 @@
+import os
 import sys
 from .base import *  # noqa: F403
 
-DEBUG = True
+DEBUG = os.getenv("DEBUG", "True").lower() in ("true", "1", "yes")
 
 # Development email backend
 EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
