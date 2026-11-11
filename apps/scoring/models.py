@@ -11,6 +11,12 @@ class RiskLevel(models.TextChoices):
     MUY_ALTO = "MUY_ALTO", "Muy Alto Riesgo (0 - 249)"
 
 
+class CreditDecisionStatus(models.TextChoices):
+    PENDING = "PENDING", "Pendiente de Comité"
+    APPROVED = "APPROVED", "Aceptado por Comité"
+    REJECTED = "REJECTED", "Rechazado por Comité"
+
+
 class ModelVersion(models.Model):
     version = models.CharField("Versión del Modelo", max_length=50, unique=True)
     algorithm = models.CharField("Algoritmo", max_length=100)
@@ -70,6 +76,33 @@ class Evaluation(models.Model):
     confidence = models.CharField("Confianza del Resultado", max_length=20, default="ALTA")
     factors = models.JSONField("Factores de Riesgo SHAP (Top 5)", default=list)
     inputs_snapshot = models.JSONField("Snapshot Inmutable de Inputs", default=dict)
+    requested_amount = models.DecimalField(
+        "Monto Solicitado (COP)",
+        max_digits=18,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    term_months = models.PositiveIntegerField(
+        "Plazo Solicitado (Meses)",
+        null=True,
+        blank=True,
+    )
+    decision_status = models.CharField(
+        "Decisión Manual de Comité",
+        max_length=20,
+        choices=CreditDecisionStatus.choices,
+        default=CreditDecisionStatus.PENDING,
+    )
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="decided_evaluations",
+        verbose_name="Decidido por",
+    )
+    decided_at = models.DateTimeField("Fecha de Decisión", null=True, blank=True)
     created_at = models.DateTimeField("Fecha de Evaluación", auto_now_add=True)
 
     class Meta:

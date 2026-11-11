@@ -1,15 +1,17 @@
 import os
 import logging
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 import joblib
 import shap
 import pandas as pd
 import numpy as np
 from django.conf import settings
+from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
-from apps.scoring.models import ModelVersion, Evaluation, RiskLevel
+from apps.scoring.models import ModelVersion, Evaluation, RiskLevel, CreditDecisionStatus
 from apps.financials.models import FinancialStatement
 from apps.financials.ratios import calculate_financial_ratios
 from apps.audit.services import log_action
@@ -206,7 +208,14 @@ def _resolve_company_age(company) -> int:
     return 5
 
 
-def evaluate_company(company, requested_by, statement: FinancialStatement = None, request=None) -> Evaluation:
+def evaluate_company(
+    company,
+    requested_by,
+    statement: FinancialStatement = None,
+    request=None,
+    requested_amount: Decimal | None = None,
+    term_months: int | None = None,
+) -> Evaluation:
     """
     Ejecuta el pipeline completo de scoring crediticio para una empresa (T4.1, T4.3, T4.4).
     """
@@ -287,9 +296,14 @@ def evaluate_company(company, requested_by, statement: FinancialStatement = None
         risk_level=risk_lvl,
         confidence=confidence,
         factors=factors_list,
+        requested_amount=requested_amount,
+        term_months=term_months,
+        decision_status=CreditDecisionStatus.PENDING,
         inputs_snapshot={
             "financial_statement_id": statement.id,
             "fiscal_year": statement.fiscal_year,
+            "requested_amount": str(requested_amount) if requested_amount is not None else None,
+            "term_months": term_months,
             "raw_inputs": raw_input_data,
             "ratios": ratios_dict,
         },
@@ -301,7 +315,12 @@ def evaluate_company(company, requested_by, statement: FinancialStatement = None
         entity="Evaluation",
         entity_id=evaluation.id,
         request=request,
-        metadata={"nit": company.nit, "score": score, "risk_level": risk_lvl},
+        metadata={
+            "nit": company.nit,
+            "score": score,
+            "risk_level": risk_lvl,
+            "requested_amount": str(requested_amount) if requested_amount is not None else None,
+        },
     )
     logger.info(
         "Evaluation created: eval_id=%s nit=%s score=%s risk=%s confidence=%s model=%s",
@@ -313,4 +332,45 @@ def evaluate_company(company, requested_by, statement: FinancialStatement = None
         model_ver.version,
     )
 
+    return evaluation
+
+
+def record_credit_decision(
+    evaluation: Evaluation,
+    admin_user,
+    decision_status: str,
+    request=None,
+) -> Evaluation:
+    """
+    Registra la decisión manual del Comité/Administrador (APPROVED o REJECTED)
+    sobre una evaluación crediticia existente, dejando trazabilidad en AuditLog.
+    Nunca ejecuta aprobación automática (AGENTS.md §1).
+    """
+    if decision_status not in (CreditDecisionStatus.APPROVED, CreditDecisionStatus.REJECTED):
+        raise ValidationError("El estado de decisión debe ser APPROVED o REJECTED.")
+
+    evaluation.decision_status = decision_status
+    evaluation.decided_by = admin_user
+    evaluation.decided_at = timezone.now()
+    evaluation.save(update_fields=["decision_status", "decided_by", "decided_at"])
+
+    log_action(
+        user=admin_user,
+        action=AuditAction.CREDIT_DECISION,
+        entity="Evaluation",
+        entity_id=evaluation.id,
+        request=request,
+        metadata={
+            "nit": evaluation.company.nit,
+            "score": evaluation.score,
+            "decision_status": decision_status,
+        },
+    )
+    logger.info(
+        "Manual credit decision recorded: eval_id=%s nit=%s decision=%s by_user_id=%s",
+        evaluation.id,
+        evaluation.company.nit,
+        decision_status,
+        admin_user.id,
+    )
     return evaluation

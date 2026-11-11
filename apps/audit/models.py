@@ -5,6 +5,7 @@ from django.conf import settings
 class AuditAction(models.TextChoices):
     SEARCH_NIT = "SEARCH_NIT", "Consulta de NIT"
     EVALUATION_REQUEST = "EVALUATION_REQUEST", "Solicitud de Evaluación"
+    CREDIT_DECISION = "CREDIT_DECISION", "Decisión Manual de Comité"
     REPORT_DOWNLOAD = "REPORT_DOWNLOAD", "Descarga de Informe PDF"
     FINANCIAL_STATEMENT_UPLOAD = "FINANCIAL_STATEMENT_UPLOAD", "Carga de Estados Financieros"
     MEMBERSHIP_APPROVAL = "MEMBERSHIP_APPROVAL", "Aprobación de Vínculo"

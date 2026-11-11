@@ -3,7 +3,11 @@ from django.urls import path, include
 
 from apps.accounts.views import AdminUserListView, AdminUserDetailView
 from apps.companies.views import AdminMembershipListView, AdminMembershipUpdateView
-from apps.scoring.views import AdminModelVersionListView, AdminModelActivateView
+from apps.scoring.views import (
+    AdminEvaluationDecisionView,
+    AdminModelActivateView,
+    AdminModelVersionListView,
+)
 from apps.audit.views import AdminAuditLogListView
 
 urlpatterns = [
@@ -19,5 +23,6 @@ urlpatterns = [
     path("api/v1/admin/memberships/<int:pk>/", AdminMembershipUpdateView.as_view(), name="admin-membership-update"),
     path("api/v1/admin/models/", AdminModelVersionListView.as_view(), name="admin-model-list"),
     path("api/v1/admin/models/<int:pk>/activate/", AdminModelActivateView.as_view(), name="admin-model-activate"),
+    path("api/v1/admin/evaluations/<int:pk>/decision/", AdminEvaluationDecisionView.as_view(), name="admin-evaluation-decision"),
     path("api/v1/admin/audit/", AdminAuditLogListView.as_view(), name="admin-audit-list"),
 ]

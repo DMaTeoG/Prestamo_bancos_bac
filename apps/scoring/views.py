@@ -10,10 +10,15 @@ from apps.companies.validators import validate_and_clean_nit
 from apps.scoring.models import Evaluation, ModelVersion
 from apps.scoring.serializers import (
     EvaluationCreateSerializer,
+    EvaluationDecisionSerializer,
     EvaluationDetailSerializer,
     ModelVersionSerializer,
 )
-from apps.scoring.services import evaluate_company, get_active_model_version
+from apps.scoring.services import (
+    evaluate_company,
+    get_active_model_version,
+    record_credit_decision,
+)
 from apps.accounts.permissions import (
     IsAdminUserRole,
     IsCompanyAuthorizedObjectPermission,
@@ -29,7 +34,9 @@ class EvaluationListCreateView(APIView):
 
     def get(self, request):
         user = request.user
-        queryset = Evaluation.objects.select_related("company", "requested_by", "model_version").all()
+        queryset = Evaluation.objects.select_related(
+            "company", "requested_by", "decided_by", "model_version"
+        ).all()
 
         # Role restrictions
         if user.role == "COMPANY" and not user.is_superuser:
@@ -37,8 +44,6 @@ class EvaluationListCreateView(APIView):
                 user=user, status="APPROVED"
             ).values_list("company_id", flat=True)
             queryset = queryset.filter(company_id__in=memberships)
-        elif user.role == "ANALYST" and not user.is_superuser:
-            queryset = queryset.filter(requested_by=user)
 
         # Filters (nit, risk_level, date_from, date_to)
         nit = request.query_params.get("nit")
@@ -61,25 +66,13 @@ class EvaluationListCreateView(APIView):
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     def post(self, request):
-        # Only ANALYST and ADMIN can request credit evaluations
-        if request.user.role == "COMPANY" and not request.user.is_superuser:
-            logger.warning(
-                "Forbidden evaluation request by COMPANY user_id=%s",
-                request.user.id,
-            )
-            return Response(
-                {
-                    "code": "FORBIDDEN",
-                    "message": "El usuario con rol Empresa no puede solicitar evaluaciones de crédito.",
-                },
-                status=status.HTTP_403_FORBIDDEN,
-            )
-
         serializer = EvaluationCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         nit_raw = serializer.validated_data["nit"]
         statement_id = serializer.validated_data.get("statement_id")
+        requested_amount = serializer.validated_data.get("requested_amount")
+        term_months = serializer.validated_data.get("term_months")
 
         try:
             nit_clean, _ = validate_and_clean_nit(nit_raw)
@@ -93,6 +86,27 @@ class EvaluationListCreateView(APIView):
                 {"code": "INVALID_NIT", "message": str(exc)},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        # COMPANY users can only request credit study/scoring for their own APPROVED NIT
+        if request.user.role == "COMPANY" and not request.user.is_superuser:
+            has_approved_membership = CompanyMembership.objects.filter(
+                user=request.user,
+                company__nit=nit_clean,
+                status="APPROVED",
+            ).exists()
+            if not has_approved_membership:
+                logger.warning(
+                    "Forbidden evaluation request by COMPANY user_id=%s for nit=%s",
+                    request.user.id,
+                    nit_clean,
+                )
+                return Response(
+                    {
+                        "code": "FORBIDDEN",
+                        "message": "El usuario con rol Empresa solo puede solicitar estudio de crédito para su propio NIT aprobado.",
+                    },
+                    status=status.HTTP_403_FORBIDDEN,
+                )
 
         company = CompanyProfile.objects.filter(nit=nit_clean).first()
         if not company:
@@ -115,7 +129,14 @@ class EvaluationListCreateView(APIView):
         if statement_id:
             statement = company.financial_statements.filter(pk=statement_id).first()
 
-        evaluation = evaluate_company(company, request.user, statement=statement, request=request)
+        evaluation = evaluate_company(
+            company,
+            request.user,
+            statement=statement,
+            request=request,
+            requested_amount=requested_amount,
+            term_months=term_months,
+        )
         detail_serializer = EvaluationDetailSerializer(evaluation)
         return Response(detail_serializer.data, status=status.HTTP_201_CREATED)
 
@@ -179,3 +200,29 @@ class AdminModelActivateView(APIView):
 
         serializer = ModelVersionSerializer(model_version)
         return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class AdminEvaluationDecisionView(APIView):
+    """
+    PATCH /api/v1/admin/evaluations/<pk>/decision/
+    Permite al Administrador registrar la decisión manual de comité (APPROVED o REJECTED)
+    apoyado en el Score y explicación SHAP de la evaluación (solo Admin).
+    """
+
+    permission_classes = [IsAdminUserRole]
+
+    def patch(self, request, pk):
+        evaluation = generics.get_object_or_404(
+            Evaluation.objects.select_related("company", "requested_by", "decided_by", "model_version"),
+            pk=pk,
+        )
+        serializer = EvaluationDecisionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        updated = record_credit_decision(
+            evaluation=evaluation,
+            admin_user=request.user,
+            decision_status=serializer.validated_data["decision_status"],
+            request=request,
+        )
+        return Response(EvaluationDetailSerializer(updated).data, status=status.HTTP_200_OK)

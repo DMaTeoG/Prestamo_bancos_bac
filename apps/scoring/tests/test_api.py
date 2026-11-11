@@ -13,6 +13,9 @@ class TestScoringAPI:
         self.analyst = CustomUser.objects.create_user(
             email="analyst_api@banco.com", password="Password123!", role=Role.ANALYST
         )
+        self.admin_user = CustomUser.objects.create_user(
+            email="admin_api@banco.com", password="Password123!", role=Role.ADMIN
+        )
         self.company_user = CustomUser.objects.create_user(
             email="company_api@banco.com", password="Password123!", role=Role.COMPANY
         )
@@ -45,6 +48,57 @@ class TestScoringAPI:
 
         assert res.status_code == 403
         assert res.data["code"] == "FORBIDDEN"
+
+    def test_company_credit_request_and_admin_manual_decision(self):
+        # 1. Approve membership for company_user on self.company
+        CompanyMembership.objects.create(
+            user=self.company_user,
+            company=self.company,
+            status="APPROVED",
+        )
+
+        # 2. Company submits credit study request with amount and term -> triggers ML scoring
+        self.client.force_authenticate(user=self.company_user)
+        url = reverse("evaluation-list-create")
+        res = self.client.post(
+            url,
+            {
+                "nit": "800197268-4",
+                "requested_amount": "350000000.00",
+                "term_months": 36,
+            },
+            format="json",
+        )
+        assert res.status_code == 201
+        eval_id = res.data["id"]
+        assert res.data["decision_status"] == "PENDING"
+        assert res.data["requested_amount"] == "350000000.00"
+        assert res.data["term_months"] == 36
+        assert 0 <= res.data["score"] <= 1000
+
+        # 3. Company or Analyst cannot call admin decision endpoint
+        decision_url = reverse("admin-evaluation-decision", kwargs={"pk": eval_id})
+        assert (
+            self.client.patch(decision_url, {"decision_status": "APPROVED"}, format="json").status_code
+            == 403
+        )
+        self.client.force_authenticate(user=self.analyst)
+        assert (
+            self.client.patch(decision_url, {"decision_status": "APPROVED"}, format="json").status_code
+            == 403
+        )
+
+        # 4. Admin reviews score and registers manual decision (APPROVED)
+        self.client.force_authenticate(user=self.admin_user)
+        decision_res = self.client.patch(
+            decision_url,
+            {"decision_status": "APPROVED"},
+            format="json",
+        )
+        assert decision_res.status_code == 200
+        assert decision_res.data["decision_status"] == "APPROVED"
+        assert decision_res.data["decided_by_email"] == "admin_api@banco.com"
+        assert decision_res.data["decided_at"] is not None
 
     def test_evaluations_invalid_nit(self):
         self.client.force_authenticate(user=self.analyst)
